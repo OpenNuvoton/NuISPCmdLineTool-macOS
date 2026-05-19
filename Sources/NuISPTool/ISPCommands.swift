@@ -1,0 +1,223 @@
+//
+//  ISPCommands.swift
+//  NuISPCmdLineTool-ASUS
+//
+//  移植自 GUI 版本的 ISPCommands.swift
+//
+
+import Foundation
+
+/// ISP 命令枚举
+enum ISPCommands: UInt {
+    case CMD_REMAIN_PACKET = 0x00000000
+    case CMD_UPDATE_APROM = 0x000000A0
+    case CMD_UPDATE_CONFIG = 0x000000A1
+    case CMD_READ_CONFIG = 0x000000A2
+    case CMD_ERASE_ALL = 0x000000A3
+    case CMD_SYNC_PACKNO = 0x000000A4
+    case CMD_GET_FWVER = 0x000000A6
+    case CMD_GET_DEVICEID = 0x000000B1
+    case CMD_UPDATE_DATAFLASH = 0x000000C3
+    case CMD_RUN_APROM = 0x000000AB
+    case CMD_RUN_LDROM = 0x000000AC
+    case CMD_RESET = 0x000000AD
+    case CMD_CONNECT = 0x000000AE
+    case CMD_RESEND_PACKET = 0x000000FF
+    // Support SPI Flash
+    case CMD_ERASE_SPIFLASH = 0x000000D0
+    case CMD_UPDATE_SPIFLASH = 0x000000D1
+}
+
+/// CAN 接口专用命令
+enum ISPCanCommands: UInt {
+    case CMD_CAN_READ_CONFIG = 0xA2000000
+    case CMD_CAN_GET_DEVICE = 0xB1000000
+    case CMD_CAN_RUN_APROM = 0xAB000000
+}
+
+/// 接口类型枚举
+enum NulinkInterfaceType {
+    case usb
+    case uart
+    case spi
+    case i2c
+    case rs485
+    case can
+    case wifi
+    case ble
+    
+    var rawValue: UInt8 {
+        switch self {
+        case .usb, .uart:
+            return 0x00
+        case .spi:
+            return 0x03
+        case .i2c:
+            return 0x04
+        case .rs485:
+            return 0x05
+        case .can:
+            return 0x06
+        case .wifi:
+            return 0x07
+        case .ble:
+            return 0x08
+        }
+    }
+}
+
+// MARK: - ISP 命令工具类
+class ISPCommandTool {
+    
+    /// 生成基本命令数据包（64 字节）
+    /// - Parameters:
+    ///   - cmd: ISP 命令
+    ///   - packetNumber: 数据包序号
+    /// - Returns: 64 字节的命令数组
+    static func toCMD(cmd: ISPCommands, packetNumber: UInt) -> [UInt8] {
+        let cmdBytes = cmd.rawValue.UIntTo4Bytes()
+        let packetNumberBytes = packetNumber.UIntTo4Bytes()
+        let noneBytes: [UInt8] = Array(repeating: 0x00, count: 56)
+        
+        var sendBytes = [UInt8]()
+        sendBytes += cmdBytes
+        sendBytes += packetNumberBytes
+        sendBytes += noneBytes
+        
+        return sendBytes
+    }
+    
+    /// 计算发送缓冲区的校验和
+    /// - Parameter sendBuffer: 发送的数据包
+    /// - Returns: 校验和
+    static func toChecksumBySendBuffer(sendBuffer: [UInt8]) -> UInt {
+        var sendBuffer = sendBuffer
+        sendBuffer[1] = 0x00 // 将不同 interface 所偷改的修正回来
+        var sum: UInt = 0
+        for byte in sendBuffer {
+            sum += UInt(byte)
+        }
+        return sum
+    }
+    
+    /// 从接收缓冲区解析校验和
+    /// - Parameter readBuffer: 接收的数据包
+    /// - Returns: 校验和
+    static func toChecksumByReadBuffer(readBuffer: [UInt8]) -> UInt {
+        let bytes: [UInt8] = [readBuffer[0], readBuffer[1], readBuffer[2], readBuffer[3]]
+        let values = bytes.map { Int($0) }
+        
+        let result = values.enumerated().reduce(0) { (acc, tuple) in
+            let (index, value) = tuple
+            return acc + (value << (index * 8))
+        }
+        return UInt(result)
+    }
+    
+    /// 从接收缓冲区解析包序号
+    /// - Parameter readBuffer: 接收的数据包
+    /// - Returns: 包序号
+    static func toPackNo(readBuffer: [UInt8]) -> UInt {
+        let bytes: [UInt8] = [readBuffer[4], readBuffer[5], readBuffer[6], readBuffer[7]]
+        let values = bytes.map { Int($0) }
+        
+        let result = values.enumerated().reduce(0) { (acc, tuple) in
+            let (index, value) = tuple
+            return acc + (value << (index * 8))
+        }
+        return UInt(result)
+    }
+    
+    /// 从接收缓冲区解析设备 ID
+    /// - Parameter readBuffer: 接收的数据包
+    /// - Returns: 设备 ID 的十六进制字符串
+    static func toDeviceID(readBuffer: [UInt8]) -> String {
+        let deviceIDArray: [UInt8] = [readBuffer[11], readBuffer[10], readBuffer[9], readBuffer[8]]
+        return Data(deviceIDArray).toHexString()
+    }
+    
+    /// 从接收缓冲区解析固件版本
+    /// - Parameter readBuffer: 接收的数据包
+    /// - Returns: 固件版本的十六进制字符串
+    static func toFirmwareVersion(readBuffer: [UInt8]) -> String? {
+        let deviceIDArray: [UInt8] = [
+            readBuffer[11], readBuffer[10], readBuffer[9], readBuffer[8]
+        ]
+        let deviceIDData = Data(deviceIDArray)
+        let byte: UInt8 = readBuffer[8]
+        let data = Data([byte])
+        return data.toHexString()
+    }
+    
+    /// 生成更新配置命令数据包
+    /// - Parameters:
+    ///   - configs: 配置值数组
+    ///   - packetNumber: 数据包序号
+    /// - Returns: 64 字节的命令数组
+    static func toUpdateConfigCMD(configs: [UInt], packetNumber: UInt) -> [UInt8] {
+        let cmdBytes = ISPCommands.CMD_UPDATE_CONFIG.rawValue.UIntTo4Bytes()
+        let packetNumberBytes = packetNumber.UIntTo4Bytes()
+        
+        var sendBytes: [UInt8] = []
+        sendBytes += cmdBytes
+        sendBytes += packetNumberBytes
+        
+        for config in configs {
+            sendBytes += config.UIntTo4Bytes()
+        }
+        
+        // 补足至 64 bytes
+        let currentLength = sendBytes.count
+        if currentLength < 64 {
+            let paddingLength = 64 - currentLength
+            let paddingBytes: [UInt8] = Array(repeating: 0x00, count: paddingLength)
+            sendBytes += paddingBytes
+        }
+        
+        return sendBytes
+    }
+    
+    /// 生成更新二进制文件命令数据包（APROM 或 Data Flash）
+    /// - Parameters:
+    ///   - cmd: 命令类型（UPDATE_APROM 或 UPDATE_DATAFLASH）
+    ///   - packetNumber: 数据包序号
+    ///   - startAddress: 起始地址
+    ///   - size: 总大小
+    ///   - data: 数据
+    ///   - isFirst: 是否为第一个数据包
+    /// - Returns: 64 字节的命令数组
+    static func toUpdateBinCMD(
+        cmd: ISPCommands,
+        packetNumber: UInt,
+        startAddress: UInt,
+        size: Int,
+        data: Data,
+        isFirst: Bool
+    ) -> [UInt8] {
+        var sendBytes = [UInt8]()
+        
+        if isFirst {
+            // 第一个数据包
+            let cmdBytes = cmd.rawValue.UIntTo4Bytes()
+            let packetNumberBytes = packetNumber.UIntTo4Bytes()
+            let addressBytes = startAddress.UIntTo4Bytes()
+            let totalSizeBytes = UInt(size).UIntTo4Bytes()
+            
+            sendBytes += cmdBytes
+            sendBytes += packetNumberBytes
+            sendBytes += addressBytes
+            sendBytes += totalSizeBytes
+            sendBytes += data
+        } else {
+            // 后续数据包
+            let cmdBytes = UInt(0x00000000).UIntTo4Bytes()
+            let packetNumberBytes = packetNumber.UIntTo4Bytes()
+            
+            sendBytes += cmdBytes
+            sendBytes += packetNumberBytes
+            sendBytes += data
+        }
+        
+        return sendBytes
+    }
+}
