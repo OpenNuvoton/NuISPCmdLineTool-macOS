@@ -34,7 +34,7 @@ Nuvoton NuMicro ISP 命令列工具 - 從 GUI 版本移植的完整命令列實�
 ## 建置
 
 ```bash
-cd NuISPCmdLineTool-ASUS
+cd NuISPCmdLineTool-macOS
 swift build
 ```
 
