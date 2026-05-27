@@ -54,6 +54,10 @@ struct NuISPTool: ParsableCommand {
     @Flag(name: .long, help: "列出可用的串埠設備")
     var listPorts: Bool = false
 
+    // 從 GitHub 更新晶片數據庫
+    @Flag(name: .long, help: "從官方 GitHub 更新晶片規格數據庫（需網路連線）")
+    var updateDB: Bool = false
+
     // 程式的主要邏輯執行處
     func run() throws {
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -64,6 +68,12 @@ struct NuISPTool: ParsableCommand {
         if listPorts {
             SerialPortEnumerator.printAvailablePorts()
             return
+        }
+        
+        // 更新晶片數據庫
+        if updateDB {
+            let success = ISPManager.shared.updateDB()
+            throw success ? ExitCode.success : ExitCode(1)
         }
         
         // 解析介面與選項

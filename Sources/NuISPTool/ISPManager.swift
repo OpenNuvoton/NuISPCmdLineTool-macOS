@@ -8,6 +8,187 @@
 
 import Foundation
 
+/// 晶片信息結構體
+struct ChipInfo {
+    let deviceID: UInt
+    let name: String
+    let apromeSize: UInt
+    let dataFlashSize: UInt  // 若為 0 表示無 Data Flash
+    let dataFlashAddr: UInt
+}
+
+// MARK: - 晶片數據庫
+//
+// 資料來源：官方 Nuvoton ISPTool_Cross_Platform GitHub 倉庫
+//   https://github.com/OpenNuvoton/ISPTool_Cross_Platform
+//
+// 使用以下三個 Python 規格文件建立晶片數據庫：
+//   Flash.py     → Flash_NuMicro 陣列（AP/DF 大小、DF 位址、PDID）
+//   PartNumID.py → PartNumIDs 陣列（PDID 對應晶片名稱）
+//   FlashInfo.py → 參考用（邏輯說明）
+//
+// 【晶片型號更新方式】
+//   本工具不內建晶片規格，首次執行時自動從 GitHub 下載並快取於本機。
+//   若 Nuvoton 發布新型號，執行以下指令更新（需網路連線）：
+//
+//     NuISPTool --update-db
+//
+//   資料將自動儲存至：
+//     ~/Library/Application Support/NuISPTool/Flash.py
+//     ~/Library/Application Support/NuISPTool/PartNumID.py
+//     ~/Library/Application Support/NuISPTool/FlashInfo.py
+
+// 官方 Python 規格文件的 GitHub raw 下載網址
+private let FLASH_PY_URL     = "https://raw.githubusercontent.com/OpenNuvoton/ISPTool_Cross_Platform/master/ISP_Command_Line_Tool_SampleCode/Flash.py"
+private let PARTNUM_PY_URL   = "https://raw.githubusercontent.com/OpenNuvoton/ISPTool_Cross_Platform/master/ISP_Command_Line_Tool_SampleCode/PartNumID.py"
+private let FLASHINFO_PY_URL = "https://raw.githubusercontent.com/OpenNuvoton/ISPTool_Cross_Platform/master/ISP_Command_Line_Tool_SampleCode/FlashInfo.py"
+
+// 執行時期 Python 規格文件目錄（Bundle.module 對應 Sources/NuISPTool/Resources/）
+private var pyResourceDir: String {
+    Bundle.module.resourcePath ?? Bundle.main.bundlePath
+}
+
+// 計算算術運算式（如 "1024 * 1024" 或 "32 * 1024" 或 "512"）
+private func evalArith(_ s: String) -> UInt? {
+    let parts = s.components(separatedBy: "*").map { $0.trimmingCharacters(in: .whitespaces) }
+    if parts.count == 1 { return UInt(parts[0]) }
+    if parts.count == 2, let a = UInt(parts[0]), let b = UInt(parts[1]) { return a * b }
+    return nil
+}
+
+/// 解析 Flash.py 中的 Flash_NuMicro 陣列
+/// 格式：[AP_size, DF_size, RAM_size, DF_address, LD_size, PDID]  #ChipName
+private func parseFlashPy(_ content: String) -> [UInt: (apSize: UInt, dfSize: UInt, dfAddr: UInt)] {
+    var result: [UInt: (apSize: UInt, dfSize: UInt, dfAddr: UInt)] = [:]
+
+    // 找到 Flash_NuMicro 區段
+    guard let startRange = content.range(of: "Flash_NuMicro = [") else { return result }
+    let section = String(content[startRange.upperBound...])
+
+    // 匹配每一行：[數字或算式, 數字或算式, 數字或算式, 0xHEX, 數字或算式, 0xHEX]
+    let pattern = #"\[\s*([\d\s*]+),\s*([\d\s*]+),\s*([\d\s*]+),\s*(0x[0-9A-Fa-f]+),\s*([\d\s*]+),\s*(0x[0-9A-Fa-f]+)\s*\]"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return result }
+
+    let nsSection = section as NSString
+    let matches = regex.matches(in: section, range: NSRange(section.startIndex..., in: section))
+    for m in matches {
+        guard m.numberOfRanges == 7 else { continue }
+        let apStr   = nsSection.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespaces)
+        let dfStr   = nsSection.substring(with: m.range(at: 2)).trimmingCharacters(in: .whitespaces)
+        let dfAStr  = nsSection.substring(with: m.range(at: 4)).trimmingCharacters(in: .whitespaces)
+        let pdidStr = nsSection.substring(with: m.range(at: 6)).trimmingCharacters(in: .whitespaces)
+        guard let apSize = evalArith(apStr),
+              let dfSize = evalArith(dfStr),
+              let dfAddr = UInt(dfAStr.dropFirst(2), radix: 16),
+              let pdid   = UInt(pdidStr.dropFirst(2), radix: 16) else { continue }
+        result[pdid] = (apSize: apSize, dfSize: dfSize, dfAddr: dfAddr)
+    }
+    return result
+}
+
+/// 解析 PartNumID.py 中的 PartNumIDs 陣列
+/// 格式：["ChipName", 0xPDID, PROJ_TYPE],
+private func parsePartNumPy(_ content: String) -> [UInt: String] {
+    var result: [UInt: String] = [:]
+    let pattern = #"\["([^"]+)"\s*,\s*(0x[0-9A-Fa-f]+)\s*,"#
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return result }
+    let ns = content as NSString
+    let matches = regex.matches(in: content, range: NSRange(content.startIndex..., in: content))
+    for m in matches {
+        guard m.numberOfRanges == 3 else { continue }
+        let name    = ns.substring(with: m.range(at: 1))
+        let pdidStr = ns.substring(with: m.range(at: 2)).trimmingCharacters(in: .whitespaces)
+        guard let pdid = UInt(pdidStr.dropFirst(2), radix: 16) else { continue }
+        result[pdid] = name
+    }
+    return result
+}
+
+/// 合併 Flash.py 和 PartNumID.py 資料，建構 ChipInfo 字典
+private func buildChipDatabase(flashContent: String, partNumContent: String) -> [UInt: ChipInfo] {
+    let flashData   = parseFlashPy(flashContent)
+    let nameData    = parsePartNumPy(partNumContent)
+    var database: [UInt: ChipInfo] = [:]
+    for (pdid, mem) in flashData {
+        let name = nameData[pdid] ?? String(format: "0x%08X", pdid)
+        database[pdid] = ChipInfo(deviceID: pdid, name: name,
+                                  apromeSize: mem.apSize,
+                                  dataFlashSize: mem.dfSize,
+                                  dataFlashAddr: mem.dfAddr)
+    }
+    return database
+}
+
+/// 從 GitHub 下載三個 Python 規格文件寫入 Bundle Resources，回傳解析結果
+private func downloadAndCachePyFiles() -> [UInt: ChipInfo]? {
+    let files: [(url: String, name: String)] = [
+        (FLASH_PY_URL,     "Flash.py"),
+        (PARTNUM_PY_URL,   "PartNumID.py"),
+        (FLASHINFO_PY_URL, "FlashInfo.py"),
+    ]
+
+    // 寫入目錄1：Bundle Resources（立即生效）
+    let bundleDir = pyResourceDir
+    // 寫入目錄2：Sources/NuISPTool/Resources/（跨 build 持久保留）
+    let cwd = FileManager.default.currentDirectoryPath
+    let sourceDir = cwd + "/Sources/NuISPTool/Resources"
+    let hasSourceDir = FileManager.default.fileExists(atPath: sourceDir)
+
+    for file in files {
+        fputs("   ⬇️  下載 \(file.name)...\n", stderr)
+        guard let url  = URL(string: file.url),
+              let data = try? Data(contentsOf: url),
+              !data.isEmpty else {
+            fputs("   ❌ 下載失敗: \(file.url)\n", stderr)
+            return nil
+        }
+        try? data.write(to: URL(fileURLWithPath: bundleDir + "/" + file.name))
+        if hasSourceDir {
+            try? data.write(to: URL(fileURLWithPath: sourceDir + "/" + file.name))
+        }
+    }
+    if hasSourceDir {
+        fputs("   📁 已同步更新 Sources/NuISPTool/Resources/\n", stderr)
+    }
+    return loadDbFromResources()
+}
+
+/// 從 Bundle Resources 讀取 Python 文件並建構數據庫
+private func loadDbFromResources() -> [UInt: ChipInfo]? {
+    let resDir = pyResourceDir
+    guard let flashContent   = try? String(contentsOfFile: resDir + "/Flash.py",     encoding: .utf8),
+          let partNumContent = try? String(contentsOfFile: resDir + "/PartNumID.py", encoding: .utf8),
+          !flashContent.isEmpty, !partNumContent.isEmpty else { return nil }
+    let db = buildChipDatabase(flashContent: flashContent, partNumContent: partNumContent)
+    return db.isEmpty ? nil : db
+}
+
+/// 初始化時加載晶片數據庫（Bundle Resources → 自動下載 → 最小備用）
+func loadChipDatabase() -> [UInt: ChipInfo] {
+    // 1. 優先從 Bundle Resources 讀取（Sources/NuISPTool/Resources/）
+    if let db = loadDbFromResources() {
+        fputs("✅ 已加載 \(db.count) 個晶片規格（來自 Resources）\n", stderr)
+        return db
+    }
+
+    // 2. Resources 內無資料（首次執行），自動從 GitHub 下載
+    fputs("ℹ️  首次執行：自動從 GitHub 下載晶片規格文件...\n", stderr)
+    if let db = downloadAndCachePyFiles() {
+        fputs("✅ 已加載 \(db.count) 個晶片規格（已儲存快取）\n", stderr)
+        return db
+    }
+
+    // 3. 無網路時的最小備用數據庫
+    fputs("⚠️  無法連線 GitHub，使用內建最小數據庫\n", stderr)
+    fputs("   如需完整支援，請連線網路後執行：NuISPTool --update-db\n", stderr)
+    return [
+        0x01B46760: ChipInfo(deviceID: 0x01B46760, name: "M467HJHAE",
+                             apromeSize: 0x100000, dataFlashSize: 0x0, dataFlashAddr: 0x0),
+        0xFFFFFFFF: ChipInfo(deviceID: 0xFFFFFFFF, name: "Unknown Chip",
+                             apromeSize: 0x20000, dataFlashSize: 0x2000, dataFlashAddr: 0x1E000),
+    ]
+}
+
 /// ISP 操作結果
 struct ISPResult {
     let success: Bool
@@ -33,12 +214,37 @@ class ISPManager: @unchecked Sendable {
     private var usbDevice: USBDevice?
     private var serialDevice: SerialDevice?
     
+    // 設備信息
+    private var currentChip: ChipInfo?
+    private var deviceIDValue: UInt = 0xFFFFFFFF
+    
+    // 晶片數據庫（動態加載）
+    private var chipDatabase: [UInt: ChipInfo] = [:]
+    
     // 配置
     private var interfaceType: NulinkInterfaceType = .usb
     private var packetNumber: UInt = 0x00000001
     private let timeout: TimeInterval = 8.0
     
-    private init() {}
+    private init() {
+        // 初始化時加載晶片數據庫（快取或自動下載）
+        self.chipDatabase = loadChipDatabase()
+    }
+    
+    /// 強制從 GitHub 更新晶片數據庫（供 --update-db 使用）
+    func updateDB() -> Bool {
+        fputs("🔄 正在從官方 ISPTool_Cross_Platform 下載晶片規格文件...\n", stderr)
+        fputs("   https://github.com/OpenNuvoton/ISPTool_Cross_Platform\n", stderr)
+        if let db = downloadAndCachePyFiles(), !db.isEmpty {
+            self.chipDatabase = db
+            fputs("✅ 更新完成，共 \(db.count) 個晶片規格\n", stderr)
+            fputs("   儲存路徑：\(pyResourceDir)/\n", stderr)
+            return true
+        } else {
+            fputs("❌ 下載失敗，請確認網路連線\n", stderr)
+            return false
+        }
+    }
     
     // MARK: - 连接管理
     
@@ -124,10 +330,28 @@ class ISPManager: @unchecked Sendable {
             return .failure(message: "校驗失敗")
         }
         
-        let deviceID = ISPCommandTool.toDeviceID(readBuffer: readBuffer)
-        print("✅ 設備 ID: 0x\(deviceID)")
+        let deviceIDStr = ISPCommandTool.toDeviceID(readBuffer: readBuffer)
+        // 轉換為 UInt
+        if let deviceID = UInt(deviceIDStr, radix: 16) {
+            self.deviceIDValue = deviceID
+            // 查詢晶片信息
+            if let chipInfo = self.chipDatabase[deviceID] {
+                self.currentChip = chipInfo
+                print("✅ 設備 ID: 0x\(deviceIDStr)")
+                print("📱 晶片型號: \(chipInfo.name)")
+                print("💾 APROM 大小: \(chipInfo.apromeSize / 1024)KB")
+                if chipInfo.dataFlashSize > 0 {
+                    print("💾 Data Flash 大小: \(chipInfo.dataFlashSize / 1024)KB")
+                } else {
+                    print("⚠️  該晶片不支援 Data Flash")
+                }
+            } else {
+                self.currentChip = self.chipDatabase[0xFFFFFFFF]  // 使用預設值
+                print("✅ 設備 ID: 0x\(deviceIDStr) (未知型號，使用預設配置)")
+            }
+        }
         
-        return .success(data: Data(readBuffer), message: "設備 ID: 0x\(deviceID)")
+        return .success(data: Data(readBuffer), message: "設備 ID: 0x\(deviceIDStr)")
     }
     
     /// 讀取配置
@@ -150,23 +374,51 @@ class ISPManager: @unchecked Sendable {
         return .success(data: Data(readBuffer), message: "配置讀取成功")
     }
     
-    /// 更新配置
-    /// - Parameter configs: 配置值陣列
+    /// 更新配置（先讀取現有值，只覆蓋指定位置，避免清除 CONFIG1/2/3）
+    /// - Parameter configs: 配置值陣列（index 0 = CONFIG0, 1 = CONFIG1, ...）
     /// - Returns: 操作結果
     func updateConfig(configs: [UInt]) -> ISPResult {
+        // 1. 先讀取裝置目前所有 config 值（與 GUI 版本相同流程）
+        let readResult = readConfig()
+        guard readResult.success, let rawData = readResult.data else {
+            return .failure(message: "讀取現有配置失敗，無法安全寫入")
+        }
+
+        // 2. 從回應 bytes[8..55] 解析 12 個 config UInt（Little-Endian）
+        let rawBytes = [UInt8](rawData)
+        var currentConfigs: [UInt] = []
+        for i in 0..<12 {
+            let offset = 8 + i * 4
+            guard offset + 3 < rawBytes.count else { break }
+            let val = UInt(rawBytes[offset])
+                    | (UInt(rawBytes[offset + 1]) << 8)
+                    | (UInt(rawBytes[offset + 2]) << 16)
+                    | (UInt(rawBytes[offset + 3]) << 24)
+            currentConfigs.append(val)
+        }
+
+        // 3. 只更新使用者指定的位置，其餘保持原值
+        for (index, value) in configs.enumerated() where index < currentConfigs.count {
+            currentConfigs[index] = value
+        }
+
         print("⚙️  更新設備配置...")
-        print("   配置值: \(configs.map { "0x" + String(format: "%08X", $0) }.joined(separator: ", "))")
-        
-        let sendBuffer = ISPCommandTool.toUpdateConfigCMD(configs: configs, packetNumber: packetNumber)
-        
+        for (i, v) in currentConfigs.prefix(4).enumerated() {
+            let changed = i < configs.count ? " ← 已修改" : ""
+            print("   CONFIG\(i): 0x\(String(format: "%08X", v))\(changed)")
+        }
+
+        // 4. 將所有 config 值一次寫回（與 GUI 版本相同）
+        let sendBuffer = ISPCommandTool.toUpdateConfigCMD(configs: currentConfigs, packetNumber: packetNumber)
+
         guard let readBuffer = sendCommand(sendBuffer) else {
             return .failure(message: "更新配置逾時", timeout: true)
         }
-        
+
         guard validateResponse(sendBuffer: sendBuffer, readBuffer: readBuffer) else {
             return .failure(message: "校驗失敗")
         }
-        
+
         print("✅ 配置更新成功")
         return .success(message: "配置更新成功")
     }
@@ -206,6 +458,11 @@ class ISPManager: @unchecked Sendable {
     ///   - startAddress: 起始地址
     /// - Returns: 操作结果
     func updateDataFlash(filePath: String, startAddress: UInt) -> ISPResult {
+        // 檢查晶片是否支援 Data Flash
+        if let chip = currentChip, chip.dataFlashSize == 0 {
+            return .failure(message: "該晶片型號 (\(chip.name)) 不支援 Data Flash，無法燒錄")
+        }
+        
         return updateBinary(filePath: filePath, cmd: .CMD_UPDATE_DATAFLASH, startAddress: startAddress, name: "Data Flash")
     }
     

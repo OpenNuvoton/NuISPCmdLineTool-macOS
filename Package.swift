@@ -16,6 +16,10 @@ let package = Package(
             dependencies: [
                 // 連結解析庫
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            resources: [
+                // Flash.py, PartNumID.py, FlashInfo.py 由 --update-db 自動更新
+                .copy("Resources"),
             ]
         ),
     ]

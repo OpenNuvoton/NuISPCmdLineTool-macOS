@@ -96,6 +96,15 @@ swift run NuISPTool -o USB -c 0x12345678 0xABCDEF00
 swift run NuISPTool -o USB -e
 ```
 
+### 8. 更新晶片規格數據庫
+
+```bash
+NuISPTool --update-db
+```
+
+從 Nuvoton 官方 GitHub 下載最新 Flash.py、PartNumID.py、FlashInfo.py，
+並更新 `Sources/NuISPTool/Resources/` 內的檔案。
+
 ## 命令列參數
 
 | 參數 | 說明 | 範例 |
@@ -106,6 +115,7 @@ swift run NuISPTool -o USB -e
 | `-c` | 更新配置（支援多個） | `-c 0x12345678 0xABCDEF00` |
 | `-e` | 全片抹除 | `-e` |
 | `--list-ports` | 列出可用串埠 | `--list-ports` |
+| `--update-db` | 更新晶片規格數據庫 | `--update-db` |
 | `-h, --help` | 顯示幫助資訊 | `--help` |
 
 ## 工作流程
@@ -141,8 +151,37 @@ NuISPCmdLineTool-ASUS/          # 專案根目錄
         ├── ISPCommands.swift   # ISP 命令定義
         ├── ISPManager.swift    # ISP 核心管理器
         ├── USBDevice.swift     # USB HID 設備通訊
-        └── SerialDevice.swift  # UART 串埠通訊
+        ├── SerialDevice.swift  # UART 串埠通訊
 ```
+├── Resources/              # 晶片規格文件（--update-db 自動更新）
+│   ├── Flash.py            # Flash_NuMicro 陣列（AP/DF 大小、位址）
+│   ├── PartNumID.py        # PartNumIDs 陣列（PDID 對應晶片名稱）
+│   └── FlashInfo.py        # 查詢邏輯說明（參考用）
+```
+
+## 晶片規格數據庫
+
+本工具不內建晶片規格，改從 Nuvoton 官方 GitHub 動態取得：
+
+**資料來源**
+> https://github.com/OpenNuvoton/ISPTool_Cross_Platform
+
+**運作方式**
+1. 首次執行時自動從 GitHub 下載三個 Python 規格文件
+2. 檔案儲存於 `Sources/NuISPTool/Resources/`，並 bundle 進可執行檔
+3. 執行時從 Bundle Resources 解析，支援 695 個以上晶片型號
+
+**更新方式**
+```bash
+NuISPTool --update-db
+```
+- 下載最新 Flash.py / PartNumID.py / FlashInfo.py
+- 同時更新 Bundle Resources（立即生效）與 `Sources/NuISPTool/Resources/`（下次 build 時打包）
+- 若 Nuvoton 發布新型號，執行此指令即可，**無需修改程式碼**
+
+**無網路時的備用機制**
+
+`Sources/NuISPTool/Resources/` 內的規格文件在 build 時即已 bundle 進可執行檔，因此即使從未執行 `--update-db`，工具仍內含完整的晶片資料庫（695+ 型號）。`--update-db` 僅在需要取得比目前 build 更新的資料時才需執行。
 
 ## 技術細節
 
