@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# 將 Nuvoton 官方規格資料檔標記為 vendored，避免影響 GitHub 語言統計
+Sources/NuISPTool/Resources/*.py linguist-vendored=true
