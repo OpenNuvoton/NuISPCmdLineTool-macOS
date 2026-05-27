@@ -257,7 +257,7 @@ ls -l /dev/tty.*
 - 避免在閉包中直接修改捕獲變數
 
 ### 移植自 GUI 版本
-
+> https://github.com/OpenNuvoton/NuISPTool-macOS
 保留了核心功能，移除了：
 - Cocoa/AppKit 相依
 - NotificationCenter 事件
