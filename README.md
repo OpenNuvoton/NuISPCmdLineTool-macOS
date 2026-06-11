@@ -141,7 +141,7 @@ NuISPTool --update-db
 ## 專案結構
 
 ```
-NuISPCmdLineTool-ASUS/          # 專案根目錄
+NuISPCmdLineTool/          # 專案根目錄
 ├── Package.swift               # Swift Package 配置
 ├── README.md                   # 專案說明文件
 └── Sources/
@@ -152,6 +152,7 @@ NuISPCmdLineTool-ASUS/          # 專案根目錄
         ├── ISPManager.swift    # ISP 核心管理器
         ├── USBDevice.swift     # USB HID 設備通訊
         ├── SerialDevice.swift  # UART 串埠通訊
+```
 ```
 ├── Resources/              # 晶片規格文件（--update-db 自動更新）
 │   ├── Flash.py            # Flash_NuMicro 陣列（AP/DF 大小、位址）
@@ -256,14 +257,13 @@ ls -l /dev/tty.*
 - 避免在閉包中直接修改捕獲變數
 
 ### 移植自 GUI 版本
+> https://github.com/OpenNuvoton/NuISPTool-macOS
 
 保留了核心功能，移除了：
 - Cocoa/AppKit 相依
 - NotificationCenter 事件
 - GUI 相關的狀態管理
 
-## 許可證
 
-本專案基於 Nuvoton 官方 ISP 協定實現。
 
 
