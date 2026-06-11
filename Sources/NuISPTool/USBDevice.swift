@@ -142,7 +142,9 @@ class USBDevice {
             
             // 驅動 RunLoop 讓 HID 回呼得以觸發
             // 命令列程式沒有自動 RunLoop，必須手動執行才能收到 HID 事件
-            CFRunLoopRunInMode(.defaultMode, 0.01, false)
+            // returnAfterSourceHandled: true → HID 回呼觸發後立即返回，不等滿 timeout
+            // 避免每包固定浪費 10ms（12,800 包 × 10ms ≈ 128 秒）
+            CFRunLoopRunInMode(.defaultMode, 0.001, true)
         }
         
         print("⏱️ USB 讀取逾時")
