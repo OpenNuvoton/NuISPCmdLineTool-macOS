@@ -529,8 +529,16 @@ class ISPManager: @unchecked Sendable {
                 return .failure(message: "更新 \(name) 逾時（包 \(currentPacket + 1)/\(totalPackets)）", timeout: true)
             }
             
-            guard validateResponse(sendBuffer: sendBuffer, readBuffer: readBuffer) else {
-                return .failure(message: "校驗失敗（包 \(currentPacket + 1)/\(totalPackets)）")
+            if !validateResponse(sendBuffer: sendBuffer, readBuffer: readBuffer) {
+                // 扇區邊界雙重回應處理：
+                // MCU 在 4KB 扇區邊界抹除時會先送出中間回應（校驗和不符），
+                // 抹除完成後才送出正確回應。清除舊緩衝並等待第二個回應。
+                print("⚠️  校驗失敗，等待 MCU 扇區抹除完成後重試讀取...")
+                guard let retryBuffer = readNextUSBResponse(timeout: 1.5),
+                      validateResponse(sendBuffer: sendBuffer, readBuffer: retryBuffer) else {
+                    return .failure(message: "校驗失敗（包 \(currentPacket + 1)/\(totalPackets)）")
+                }
+                print("✅ 重試讀取成功（扇區邊界中間回應已跳過）")
             }
             
             offset += dataSize
@@ -546,6 +554,18 @@ class ISPManager: @unchecked Sendable {
         return .success(message: "\(name) 更新完成")
     }
     
+    /// 在校驗失敗後嘗試讀取下一個回應（用於 4KB 扇區邊界的雙重回應情況）
+    ///
+    /// Nuvoton M467/M460 ISP bootloader 在封包橫跨 4KB 扇區邊界時會先送出一個
+    /// 中間回應（校驗和不符），等待扇區抹除完成後再送出正確回應。
+    /// 此方法同步清除舊回應，並等待正確的第二個回應。
+    private func readNextUSBResponse(timeout: TimeInterval = 1.0) -> [UInt8]? {
+        guard let usb = usbDevice else { return nil }
+        usb.clearBufferSync()   // 同步清除中間回應
+        let data = usb.read(timeout: timeout)
+        return data?.toUint8Array
+    }
+
     /// 發送命令並接收響應
     private func sendCommand(_ sendBuffer: [UInt8]) -> [UInt8]? {
         if interfaceType == .uart {

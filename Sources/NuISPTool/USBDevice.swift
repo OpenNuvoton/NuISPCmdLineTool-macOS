@@ -151,9 +151,16 @@ class USBDevice {
         return nil
     }
     
-    /// 清除接收缓冲区
+    /// 清除接收缓冲区（非同步）
     func clearBuffer() {
         bufferQueue.async {
+            self.receiveBuffer = nil
+        }
+    }
+
+    /// 同步清除接收緩衝區（用於重試讀取前確保舊資料已清除）
+    func clearBufferSync() {
+        bufferQueue.sync {
             self.receiveBuffer = nil
         }
     }
