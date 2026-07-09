@@ -193,31 +193,41 @@ class USBDeviceManager: @unchecked Sendable {
             return nil
         }
         
-        // 查找 Nuvoton 設備（VID: 0x0416）
+        // 支援的 ISP 設備清單（VID, PID）；PID 為 nil 表示符合該 VID 的所有 PID
+        let supportedDevices: [(vid: Int, pid: Int?, label: String)] = [
+            (0x0416, nil,    "Nuvoton ISP"),   // Nuvoton 全系列
+            (0x0B05, nil, "Test ISP"),      // ASUS VID/PID
+        ]
+
+        // 查找符合的設備
         for device in deviceSet {
             if let vendorID = IOHIDDeviceGetProperty(device, kIOHIDVendorIDKey as CFString) as? Int,
                let productID = IOHIDDeviceGetProperty(device, kIOHIDProductIDKey as CFString) as? Int {
-                
-                // Nuvoton VID: 0x0416
-                if vendorID == 0x0416 {
-                    let reportSize = IOHIDDeviceGetProperty(device, kIOHIDMaxInputReportSizeKey as CFString) as? Int ?? 64
-                    
-                    print("✅ 找到 Nuvoton 設備:")
-                    print("   VID: 0x\(String(format: "%04X", vendorID))")
-                    print("   PID: 0x\(String(format: "%04X", productID))")
-                    print("   報告大小: \(reportSize) 位元組")
-                    
-                    return HIDDeviceInfo(
-                        device: device,
-                        vendorID: vendorID,
-                        productID: productID,
-                        reportSize: reportSize
-                    )
+
+                for entry in supportedDevices {
+                    let vidMatch = vendorID == entry.vid
+                    let pidMatch = entry.pid == nil || productID == entry.pid!
+
+                    if vidMatch && pidMatch {
+                        let reportSize = IOHIDDeviceGetProperty(device, kIOHIDMaxInputReportSizeKey as CFString) as? Int ?? 64
+
+                        print("✅ 找到 \(entry.label) 設備:")
+                        print("   VID: 0x\(String(format: "%04X", vendorID))")
+                        print("   PID: 0x\(String(format: "%04X", productID))")
+                        print("   報告大小: \(reportSize) 位元組")
+
+                        return HIDDeviceInfo(
+                            device: device,
+                            vendorID: vendorID,
+                            productID: productID,
+                            reportSize: reportSize
+                        )
+                    }
                 }
             }
         }
-        
-        print("❌ 未找到 Nuvoton ISP 設備（VID: 0x0416）")
+
+        print("❌ 未找到支援的 ISP 設備（Nuvoton VID: 0x0416 / ASUS VID: 0x0B05 PID: 0x1D27）")
         return nil
     }
     

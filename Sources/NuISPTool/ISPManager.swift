@@ -516,29 +516,59 @@ class ISPManager: @unchecked Sendable {
                 chunkData.append(contentsOf: Array(repeating: 0x00, count: chunkSize - chunkData.count))
             }
             
-            let sendBuffer = ISPCommandTool.toUpdateBinCMD(
-                cmd: cmd,
-                packetNumber: packetNumber,
-                startAddress: startAddress,
-                size: fileSize,
-                data: chunkData,
-                isFirst: isFirst
-            )
+            // 對應 C++ 版 Thread_ProgramFlash() 中的 `unsigned int uRetry = 10;` 重試迴圈。
+            // 每個封包最多重試 10 次，每次重試前都會重新組出封包（序號可能已前進）。
+            var resendRetry = 10
+            var packetAccepted = false
             
-            guard let readBuffer = sendCommand(sendBuffer) else {
-                return .failure(message: "更新 \(name) 逾時（包 \(currentPacket + 1)/\(totalPackets)）", timeout: true)
-            }
-            
-            if !validateResponse(sendBuffer: sendBuffer, readBuffer: readBuffer) {
+            while true {
+                let sendBuffer = ISPCommandTool.toUpdateBinCMD(
+                    cmd: cmd,
+                    packetNumber: packetNumber,
+                    startAddress: startAddress,
+                    size: fileSize,
+                    data: chunkData,
+                    isFirst: isFirst
+                )
+                
+                guard let readBuffer = sendCommand(sendBuffer) else {
+                    return .failure(message: "更新 \(name) 逾時（包 \(currentPacket + 1)/\(totalPackets)）", timeout: true)
+                }
+                
+                if validateResponse(sendBuffer: sendBuffer, readBuffer: readBuffer) {
+                    packetAccepted = true
+                    break
+                }
+                
                 // 扇區邊界雙重回應處理：
                 // MCU 在 4KB 扇區邊界抹除時會先送出中間回應（校驗和不符），
                 // 抹除完成後才送出正確回應。清除舊緩衝並等待第二個回應。
                 print("⚠️  校驗失敗，等待 MCU 扇區抹除完成後重試讀取...")
-                guard let retryBuffer = readNextUSBResponse(timeout: 1.5),
-                      validateResponse(sendBuffer: sendBuffer, readBuffer: retryBuffer) else {
+                if let retryBuffer = readNextUSBResponse(timeout: 1.5),
+                   validateResponse(sendBuffer: sendBuffer, readBuffer: retryBuffer) {
+                    print("✅ 重試讀取成功（扇區邊界中間回應已跳過）")
+                    packetAccepted = true
+                    break
+                }
+                
+                // 校驗仍然失敗，對應 C++ 版 `m_ISPLdDev.bResendFlag` 為真的分支：
+                // 送出 CMD_RESEND_PACKET 確認連線是否仍存活（對應 CMD_Resend()），
+                // 成功才重送本封包；重試次數用盡、或為第一包（對應 i == 0）、
+                // 或 CMD_RESEND_PACKET 本身失敗，都直接判定燒錄失敗。
+                resendRetry -= 1
+                // 對應 C++ 版 WriteFile 成功即遞增 m_uCmdIndex：
+                // 無論回應內容是否正確，封包本身已送達，序號需前進一輪。
+                packetNumber += 2
+                
+                if resendRetry <= 0 || isFirst || !sendResendPacket() {
                     return .failure(message: "校驗失敗（包 \(currentPacket + 1)/\(totalPackets)）")
                 }
-                print("✅ 重試讀取成功（扇區邊界中間回應已跳過）")
+                
+                print("🔄 已送出 CMD_RESEND_PACKET，重送封包（剩餘重試次數 \(resendRetry)）...")
+            }
+            
+            if !packetAccepted {
+                return .failure(message: "校驗失敗（包 \(currentPacket + 1)/\(totalPackets)）")
             }
             
             offset += dataSize
@@ -564,6 +594,35 @@ class ISPManager: @unchecked Sendable {
         usb.clearBufferSync()   // 同步清除中間回應
         let data = usb.read(timeout: timeout)
         return data?.toUint8Array
+    }
+    
+    /// 送出 CMD_RESEND_PACKET，請求裝置重新傳送前一個遺失/毀損的回應封包
+    ///
+    /// 對應 C++ 版 `ISPLdCMD::CMD_Resend()`：
+    /// 用於校驗連續失敗時，先確認連線是否仍然存活（裝置仍能正確回應），
+    /// 成功的話再由呼叫端重送目前的資料封包；若連 CMD_RESEND_PACKET 都失敗，
+    /// 表示連線已經中斷，應立即判定燒錄失敗。
+    private func sendResendPacket() -> Bool {
+        let sendBuffer = ISPCommandTool.toCMD(cmd: .CMD_RESEND_PACKET, packetNumber: packetNumber)
+        
+        guard let readBuffer = sendCommand(sendBuffer) else {
+            print("❌ CMD_RESEND_PACKET 逾時")
+            return false
+        }
+        
+        // 對應 C++ 版 ReadFile(..., bCheckIndex = FALSE)：
+        // 連線可能已不同步，因此只驗證校驗和，不驗證封包序號。
+        let checksum = ISPCommandTool.toChecksumBySendBuffer(sendBuffer: sendBuffer)
+        let resultChecksum = ISPCommandTool.toChecksumByReadBuffer(readBuffer: readBuffer)
+        
+        guard checksum == resultChecksum else {
+            print("❌ CMD_RESEND_PACKET 校驗失敗")
+            return false
+        }
+        
+        // 對應 C++ 版 WriteFile 成功即遞增 m_uCmdIndex：封包已送達，序號前進一輪。
+        packetNumber += 2
+        return true
     }
 
     /// 發送命令並接收響應
