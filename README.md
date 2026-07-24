@@ -17,7 +17,7 @@ Nuvoton NuMicro ISP 命令列工具 - 從 GUI 版本移植的完整命令列實�
 ✅ **多介面支援**
 - USB HID（預設）
 - UART 串埠
-- 預留 SPI/I2C/RS485/CAN 介面支援
+- SPI / I2C / RS485 / CAN（皆透過 Nu-Link2-Pro 轉接器，同一個 USB HID 裝置，PID 0x3F10）
 
 ✅ **協定實現**
 - 完整的 ISP 協定棧
@@ -80,6 +80,20 @@ swift run NuISPTool -o UART /dev/tty.usbserial-xxx -a firmware.bin
 swift run NuISPTool -o USB -d dataflash.bin
 ```
 
+### 5a. SPI / I2C / RS485 / CAN 介面更新 APROM
+
+需搭配 Nu-Link2-Pro 轉接器（USB HID，PID 0x3F10）：
+
+```bash
+swift run NuISPTool -o SPI -a firmware.bin
+swift run NuISPTool -o I2C -a firmware.bin
+swift run NuISPTool -o RS485 -a firmware.bin
+swift run NuISPTool -o CAN -a firmware.bin
+```
+
+> **CAN 介面注意事項**：封包格式與 USB/UART 不同（無 cmd word，4 bytes 為一個分包單位），
+> 且沒有 checksum／包序號機制（只要收到回應即視為成功）；更新 Config 僅支援 CONFIG0~3。
+
 ### 6. 更新使用者配置
 
 ```bash
@@ -109,13 +123,14 @@ NuISPTool --update-db
 
 | 參數 | 說明 | 範例 |
 |------|------|------|
-| `-o` | 指定通訊介面 | `-o USB` 或 `-o UART /dev/tty.xxx` |
+| `-o` | 指定通訊介面（USB/UART/SPI/I2C/RS485/CAN） | `-o USB` 或 `-o UART /dev/tty.xxx` 或 `-o CAN` |
 | `-a` | 更新 APROM 韌體 | `-a firmware.bin` |
 | `-d` | 更新 Data Flash | `-d dataflash.bin` |
 | `-c` | 更新配置（支援多個） | `-c 0x12345678 0xABCDEF00` |
 | `-e` | 全片抹除 | `-e` |
 | `--list-ports` | 列出可用串埠 | `--list-ports` |
 | `--update-db` | 更新晶片規格數據庫 | `--update-db` |
+| `--verbose` | 詳細模式：印出每個封包的 USB 收發 hex 內容（預設關閉） | `--verbose` |
 | `-h, --help` | 顯示幫助資訊 | `--help` |
 
 ## 工作流程
@@ -123,6 +138,7 @@ NuISPTool --update-db
 1. **連接設備**
    - USB: 自動搜尋 Nuvoton 設備 (VID: 0x0416)
    - UART: 使用指定的串埠路徑
+   - SPI/I2C/RS485/CAN: 透過 Nu-Link2-Pro 轉接器（同一顆 USB HID 裝置，PID 0x3F10）
 
 2. **建立連接**
    - 發送 CONNECT 命令
@@ -207,7 +223,24 @@ CMD_ERASE_ALL       = 0xA3  // 全片抹除
 CMD_GET_DEVICEID    = 0xB1  // 獲取設備 ID
 CMD_UPDATE_DATAFLASH= 0xC3  // 更新 Data Flash
 CMD_RUN_APROM       = 0xAB  // 執行 APROM
+CMD_RESEND_PACKET   = 0xFF  // 請求裝置重送/確認連線存活（校驗失敗時觸發）
 ```
+
+### 校驗失敗重試/重送機制（CMD_RESEND_PACKET）
+
+每包資料送出後會驗證回應的 checksum 與包序號，若不符：
+1. 先送出 `CMD_RESEND_PACKET`（只校驗 checksum，不校驗包序號，因連線可能已不同步），確認裝置仍在線
+2. 確認成功後重新送出同一筆資料（最多重試 10 次，對應 C++ 版 `uRetry = 10`）
+3. 若 `CMD_RESEND_PACKET` 也失敗，表示連線已中斷，立即判定燒錄失敗
+
+### 開關印刷（`--verbose`）
+
+預設情況下，燒錄過程只印出必要狀態訊息，**不會**印出每個封包的完整 hex 內容。
+燒錄大檔案時每包都印出 hex dump（`--verbose` 開啟時）會產生數千至數萬次終端機輸出，
+實測對總燒錄時間有可觀察的影響，因此預設關閉此逐包印刷，只有加上 `--verbose` 才會開啟，
+方便除錯時查看每包實際收發內容。程式內對應開關為 `ISPLogConfig.verboseHex`（`USBDevice.swift`）。
+
+
 
 ## 與 GUI 版本的對比
 
@@ -217,6 +250,7 @@ CMD_RUN_APROM       = 0xAB  // 執行 APROM
 | 相依 | CocoaPods, ORSSerialPort | Swift Package Manager |
 | USB 支援 | ✅ | ✅ |
 | UART 支援 | ✅ | ✅ |
+| SPI/I2C/RS485/CAN 支援 | ✅（需 Nu-Link2-Pro） | ✅（需 Nu-Link2-Pro） |
 | 配置檔案 | JSON + UI | 命令列參數 |
 | 批次處理 | ❌ | ✅（可腳本化） |
 | 自動化 | ❌ | ✅（CI/CD 友好） |

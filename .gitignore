@@ -60,3 +60,6 @@ fastlane/report.xml
 fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
+
+# 真實/客戶測試韌體 bin 檔，不進版控
+tests/tmp/*.bin

@@ -11,8 +11,9 @@ struct NuISPTool: ParsableCommand {
         commandName: "NuISPTool",
         abstract: "Nuvoton NuMicro ISP 命令列工具",
         discussion: """
-        支援透過 USB 或 UART 介面對 Nuvoton 微控制器進行 ISP 編程。
-        SPI/I2C/RS485/CAN 介面需搭配 Nu-Link2-Pro 轉接器（尚未支援）。
+        支援透過 USB、UART、SPI、I2C、RS485、CAN 介面對 Nuvoton 微控制器進行 ISP 編程。
+        SPI/I2C/RS485/CAN 皆透過 Nu-Link2-Pro 轉接器（同一個 USB HID 裝置，PID 0x3F10）。
+        WiFi/BLE 尚未支援（規劃於後續計畫）。
         
         使用範例:
           # USB 介面更新 APROM（預設介面）
@@ -22,7 +23,13 @@ struct NuISPTool: ParsableCommand {
           # UART 介面更新 APROM
           NuISPTool -o UART /dev/tty.usbserial-xxx -a firmware.bin
           
-          # 更新配置（空格分隔多個值）
+          # SPI/I2C/RS485/CAN 介面更新 APROM（透過 Nu-Link2-Pro 轉接器）
+          NuISPTool -o SPI -a firmware.bin
+          NuISPTool -o I2C -a firmware.bin
+          NuISPTool -o RS485 -a firmware.bin
+          NuISPTool -o CAN -a firmware.bin
+          
+          # 更新配置（空格分隔多個值；CAN 介面僅支援 CONFIG0~3）
           NuISPTool -o USB -c 0xFFFFFF7E 0xFFFFFFFF
           
           # 全片抹除
@@ -31,7 +38,7 @@ struct NuISPTool: ParsableCommand {
     )
 
     // 連接介面: 手冊定義包含介面名稱與選填選項，預設為 USB
-    @Option(name: .short, help: "指定介面 (USB, UART)；SPI/I2C/RS485/CAN 需 Nu-Link2-Pro 硬體")
+    @Option(name: .short, help: "指定介面 (USB, UART, SPI, I2C, RS485, CAN)；SPI/I2C/RS485/CAN 需 Nu-Link2-Pro 硬體")
     var o: [String] = []
 
     // APROM 更新檔案路徑
@@ -58,8 +65,14 @@ struct NuISPTool: ParsableCommand {
     @Flag(name: .long, help: "從官方 GitHub 更新晶片規格數據庫（需網路連線）")
     var updateDB: Bool = false
 
+    // 詳細模式：印出每個封包的完整 USB 收發 hex dump（預設關閉，燒錄大檔案時可大幅減少終端機輸出開銷）
+    @Flag(name: .long, help: "詳細模式：印出每個封包的 USB 收發內容（預設關閉）")
+    var verbose: Bool = false
+
     // 程式的主要邏輯執行處
     func run() throws {
+        ISPLogConfig.verboseHex = verbose
+
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         print("🛠  Nuvoton ISP 命令列工具 v1.0")
         print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -93,6 +106,11 @@ struct NuISPTool: ParsableCommand {
             throw ExitCode.validationFailure
         }
         
+        // CAN 介面僅支援 CONFIG0~3，超過 4 組先提示警告
+        if interface == "CAN" && c.count > 4 {
+            print("⚠️  CAN 介面僅支援 CONFIG0~3（最多 4 組），超出的值將被忽略")
+        }
+        
         // 檢查是否有操作
         guard operationCount > 0 else {
             print("\n💡 提示: 未指定操作。請使用 --help 查看用法。")
@@ -106,7 +124,15 @@ struct NuISPTool: ParsableCommand {
         let connected: Bool
         switch interface {
         case "USB":
-            connected = isp.connectUSB()
+            connected = isp.connectUSB(interfaceType: .usb)
+        case "SPI":
+            connected = isp.connectUSB(interfaceType: .spi)
+        case "I2C":
+            connected = isp.connectUSB(interfaceType: .i2c)
+        case "RS485":
+            connected = isp.connectUSB(interfaceType: .rs485)
+        case "CAN":
+            connected = isp.connectUSB(interfaceType: .can)
         case "UART":
             guard let port = intfOption else {
                 print("❌ 錯誤: UART 介面需要指定埠路徑")
@@ -116,7 +142,7 @@ struct NuISPTool: ParsableCommand {
             connected = isp.connectUART(portPath: port)
         default:
             print("❌ 錯誤: 暫不支援介面類型: \(interface)")
-            print("💡 提示: 目前支援 USB 和 UART")
+            print("💡 提示: 目前支援 USB、UART、SPI、I2C、RS485、CAN；WiFi/BLE 尚未支援（規劃於後續計畫）")
             throw ExitCode.validationFailure
         }
         

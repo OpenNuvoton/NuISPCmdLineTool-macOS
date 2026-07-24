@@ -249,16 +249,17 @@ class ISPManager: @unchecked Sendable {
     // MARK: - 连接管理
     
     /// 使用 USB 連接設備
+    /// - Parameter interfaceType: 介面類型（USB／SPI／I2C／RS485／CAN，皆走同一個 HID 傳輸，只是 tag byte／裝置 PID 不同）
     /// - Returns: 是否成功連接
-    func connectUSB() -> Bool {
+    func connectUSB(interfaceType: NulinkInterfaceType = .usb) -> Bool {
         print("\n🔍 正在搜尋 USB 設備...")
         
-        guard let deviceInfo = USBDeviceManager.shared.findNuvotonDevice() else {
+        guard let deviceInfo = USBDeviceManager.shared.findNuvotonDevice(interfaceType: interfaceType) else {
             return false
         }
         
         usbDevice = USBDevice(deviceInfo)
-        interfaceType = .usb
+        self.interfaceType = interfaceType
         
         print("✅ USB 設備已連接\n")
         return true
@@ -317,6 +318,11 @@ class ISPManager: @unchecked Sendable {
     /// 獲取設備 ID
     /// - Returns: 操作結果（data 中包含設備 ID）
     func getDeviceID() -> ISPResult {
+        // CAN 介面：封包格式與解析位置皆與一般版不同（無 checksum/packetNumber）
+        if interfaceType == .can {
+            return getDeviceIDCAN()
+        }
+
         print("🔍 讀取設備 ID...")
         
         let cmd = ISPCommands.CMD_GET_DEVICEID
@@ -353,10 +359,15 @@ class ISPManager: @unchecked Sendable {
         
         return .success(data: Data(readBuffer), message: "設備 ID: 0x\(deviceIDStr)")
     }
-    
+
     /// 讀取配置
     /// - Returns: 操作結果
     func readConfig() -> ISPResult {
+        // CAN 介面：只支援 CONFIG0~3，須分 4 次個別讀取
+        if interfaceType == .can {
+            return readConfigCAN()
+        }
+
         print("📖 讀取設備配置...")
         
         let cmd = ISPCommands.CMD_READ_CONFIG
@@ -378,6 +389,11 @@ class ISPManager: @unchecked Sendable {
     /// - Parameter configs: 配置值陣列（index 0 = CONFIG0, 1 = CONFIG1, ...）
     /// - Returns: 操作結果
     func updateConfig(configs: [UInt]) -> ISPResult {
+        // CAN 介面：封包格式不同、只支援 CONFIG0~3，須分 4 次個別寫入
+        if interfaceType == .can {
+            return updateConfigCAN(configs: configs)
+        }
+
         // 1. 先讀取裝置目前所有 config 值（與 GUI 版本相同流程）
         let readResult = readConfig()
         guard readResult.success, let rawData = readResult.data else {
@@ -469,6 +485,11 @@ class ISPManager: @unchecked Sendable {
     /// 运行 APROM
     /// - Returns: 操作结果
     func runAPROM() -> ISPResult {
+        // CAN 介面：使用專屬 RUN_APROM 封包
+        if interfaceType == .can {
+            return runAPROMCAN()
+        }
+
         print("🚀 送出 RUN_APROM 命令...")
         
         let cmd = ISPCommands.CMD_RUN_APROM
@@ -493,9 +514,14 @@ class ISPManager: @unchecked Sendable {
         guard let fileData = try? Data(contentsOf: URL(fileURLWithPath: filePath)) else {
             return .failure(message: "無法讀取檔案: \(filePath)")
         }
-        
+
         let fileSize = fileData.count
         print("   檔案大小: \(fileSize) 位元組")
+
+        // CAN 介面：封包格式不同（無 CMD word，4 bytes 為一個分包單位）
+        if interfaceType == .can {
+            return updateBinaryCAN(fileData: fileData, startAddress: startAddress, name: name)
+        }
         
         // 第一包 header = cmd(4)+packetNo(4)+address(4)+size(4) = 16 bytes，資料最多 48 bytes
         // 後續包 header = cmd(4)+packetNo(4) = 8 bytes，資料最多 56 bytes
@@ -505,6 +531,7 @@ class ISPManager: @unchecked Sendable {
         var offset = 0
         var isFirst = true
         var currentPacket = 0
+        var lastReportedProgress = -1
         
         while offset < fileSize {
             let chunkSize = isFirst ? firstChunkSize : remainChunkSize
@@ -516,11 +543,10 @@ class ISPManager: @unchecked Sendable {
                 chunkData.append(contentsOf: Array(repeating: 0x00, count: chunkSize - chunkData.count))
             }
             
-            // 對應 C++ 版 Thread_ProgramFlash() 中的 `unsigned int uRetry = 10;` 重試迴圈。
-            // 每個封包最多重試 10 次，每次重試前都會重新組出封包（序號可能已前進）。
+            // 對應 C++ 版 Thread_ProgramFlash() 中的 `unsigned int uRetry = 10;` 重試迴圈
             var resendRetry = 10
             var packetAccepted = false
-            
+
             while true {
                 let sendBuffer = ISPCommandTool.toUpdateBinCMD(
                     cmd: cmd,
@@ -530,40 +556,28 @@ class ISPManager: @unchecked Sendable {
                     data: chunkData,
                     isFirst: isFirst
                 )
-                
+
                 guard let readBuffer = sendCommand(sendBuffer) else {
                     return .failure(message: "更新 \(name) 逾時（包 \(currentPacket + 1)/\(totalPackets)）", timeout: true)
                 }
-                
+
                 if validateResponse(sendBuffer: sendBuffer, readBuffer: readBuffer) {
                     packetAccepted = true
                     break
                 }
-                
-                // 扇區邊界雙重回應處理：
-                // MCU 在 4KB 扇區邊界抹除時會先送出中間回應（校驗和不符），
-                // 抹除完成後才送出正確回應。清除舊緩衝並等待第二個回應。
-                print("⚠️  校驗失敗，等待 MCU 扇區抹除完成後重試讀取...")
-                if let retryBuffer = readNextUSBResponse(timeout: 1.5),
-                   validateResponse(sendBuffer: sendBuffer, readBuffer: retryBuffer) {
-                    print("✅ 重試讀取成功（扇區邊界中間回應已跳過）")
-                    packetAccepted = true
-                    break
-                }
-                
-                // 校驗仍然失敗，對應 C++ 版 `m_ISPLdDev.bResendFlag` 為真的分支：
-                // 送出 CMD_RESEND_PACKET 確認連線是否仍存活（對應 CMD_Resend()），
-                // 成功才重送本封包；重試次數用盡、或為第一包（對應 i == 0）、
-                // 或 CMD_RESEND_PACKET 本身失敗，都直接判定燒錄失敗。
+
                 resendRetry -= 1
-                // 對應 C++ 版 WriteFile 成功即遞增 m_uCmdIndex：
-                // 無論回應內容是否正確，封包本身已送達，序號需前進一輪。
                 packetNumber += 2
-                
-                if resendRetry <= 0 || isFirst || !sendResendPacket() {
+
+                if resendRetry <= 0 || isFirst {
                     return .failure(message: "校驗失敗（包 \(currentPacket + 1)/\(totalPackets)）")
                 }
-                
+
+                let resendOk = sendResendPacket()
+                if !resendOk {
+                    return .failure(message: "校驗失敗（包 \(currentPacket + 1)/\(totalPackets)）")
+                }
+
                 print("🔄 已送出 CMD_RESEND_PACKET，重送封包（剩餘重試次數 \(resendRetry)）...")
             }
             
@@ -575,25 +589,16 @@ class ISPManager: @unchecked Sendable {
             isFirst = false
             currentPacket += 1
             
-            // 顯示進度
+            // 顯示進度（節流：僅在百分比變化時列印，避免每包都輸出造成額外終端機開銷）
             let progress = (currentPacket * 100) / totalPackets
-            print("   進度: \(progress)% (\(currentPacket)/\(totalPackets) 包)")
+            if progress != lastReportedProgress {
+                print("   進度: \(progress)% (\(currentPacket)/\(totalPackets) 包)")
+                lastReportedProgress = progress
+            }
         }
         
         print("✅ \(name) 更新完成")
         return .success(message: "\(name) 更新完成")
-    }
-    
-    /// 在校驗失敗後嘗試讀取下一個回應（用於 4KB 扇區邊界的雙重回應情況）
-    ///
-    /// Nuvoton M467/M460 ISP bootloader 在封包橫跨 4KB 扇區邊界時會先送出一個
-    /// 中間回應（校驗和不符），等待扇區抹除完成後再送出正確回應。
-    /// 此方法同步清除舊回應，並等待正確的第二個回應。
-    private func readNextUSBResponse(timeout: TimeInterval = 1.0) -> [UInt8]? {
-        guard let usb = usbDevice else { return nil }
-        usb.clearBufferSync()   // 同步清除中間回應
-        let data = usb.read(timeout: timeout)
-        return data?.toUint8Array
     }
     
     /// 送出 CMD_RESEND_PACKET，請求裝置重新傳送前一個遺失/毀損的回應封包
@@ -642,7 +647,7 @@ class ISPManager: @unchecked Sendable {
                 print("❌ USB 設備未初始化")
                 return nil
             }
-            
+
             usb.write(sendBuffer, interfaceType: interfaceType)
             let data = usb.read(timeout: timeout)
             return data?.toUint8Array
@@ -651,6 +656,11 @@ class ISPManager: @unchecked Sendable {
     
     /// 驗證響應（校驗和 + 包序號）
     private func validateResponse(sendBuffer: [UInt8], readBuffer: [UInt8]) -> Bool {
+        // CAN 沒有 checksum／packet number 機制，只要有收到回應即視為成功（比照 Android 版 isChecksum_PackNo）
+        if interfaceType == .can {
+            return true
+        }
+
         // 校驗 checksum
         let checksum = ISPCommandTool.toChecksumBySendBuffer(sendBuffer: sendBuffer)
         let resultChecksum = ISPCommandTool.toChecksumByReadBuffer(readBuffer: readBuffer)
@@ -673,5 +683,149 @@ class ISPManager: @unchecked Sendable {
         packetNumber = expectedPackNo + 1
         
         return true
+    }
+
+    // MARK: - CAN 專屬流程（封包格式與一般 USB/UART 完全不同，移植自 Android 版 ISPManager.kt；無 checksum/packetNumber 機制）
+
+    /// CAN：獲取設備 ID
+    private func getDeviceIDCAN() -> ISPResult {
+        print("🔍 讀取設備 ID (CAN)...")
+
+        let sendBuffer = ISPCommandTool.toCanGetDeviceCMD()
+        guard let readBuffer = sendCommand(sendBuffer), readBuffer.count >= 8 else {
+            return .failure(message: "讀取設備 ID 逾時 (CAN)", timeout: true)
+        }
+
+        let deviceIDStr = ISPCommandTool.toCANDeviceID(readBuffer: readBuffer)
+        if let deviceID = UInt(deviceIDStr, radix: 16) {
+            self.deviceIDValue = deviceID
+            if let chipInfo = self.chipDatabase[deviceID] {
+                self.currentChip = chipInfo
+                print("✅ 設備 ID: 0x\(deviceIDStr)")
+                print("📱 晶片型號: \(chipInfo.name)")
+                print("💾 APROM 大小: \(chipInfo.apromeSize / 1024)KB")
+                if chipInfo.dataFlashSize > 0 {
+                    print("💾 Data Flash 大小: \(chipInfo.dataFlashSize / 1024)KB")
+                } else {
+                    print("⚠️  該晶片不支援 Data Flash")
+                }
+            } else {
+                self.currentChip = self.chipDatabase[0xFFFFFFFF]
+                print("✅ 設備 ID: 0x\(deviceIDStr) (未知型號，使用預設配置)")
+            }
+        }
+
+        return .success(data: Data(readBuffer), message: "設備 ID: 0x\(deviceIDStr)")
+    }
+
+    /// CAN：讀取配置（僅支援 CONFIG0~3，須分 4 次個別讀取）
+    private func readConfigCAN() -> ISPResult {
+        print("📖 讀取設備配置 (CAN，僅 CONFIG0~3)...")
+
+        // 比照 Android configbyteArray 組法：8 個 0x00 header + 4 組各自回應的 bytes[4..<8]
+        // 讓解析出的緩衝區與一般版 offset(8+i*4) 的佈局相容
+        var combined: [UInt8] = Array(repeating: 0x00, count: 8)
+
+        for index in 0..<4 {
+            let sendBuffer = ISPCommandTool.toCanReadConfigCMD(index: index)
+            guard let readBuffer = sendCommand(sendBuffer), readBuffer.count >= 8 else {
+                return .failure(message: "讀取設備配置逾時 (CAN，CONFIG\(index))", timeout: true)
+            }
+            combined += Array(readBuffer[4..<8])
+        }
+
+        print("✅ 配置讀取成功 (CAN)")
+        return .success(data: Data(combined), message: "配置讀取成功")
+    }
+
+    /// CAN：更新配置（僅支援 CONFIG0~3，須分 4 次個別寫入，先讀後寫避免覆蓋未指定的值）
+    private func updateConfigCAN(configs: [UInt]) -> ISPResult {
+        // 註：CAN 僅支援 CONFIG0~3，超出範圍的設定值會被忽略（呼叫端 NuISPTool.swift 已於送出前提示警告）
+        let readResult = readConfigCAN()
+        guard readResult.success, let rawData = readResult.data else {
+            return .failure(message: "讀取現有配置失敗，無法安全寫入 (CAN)")
+        }
+
+        let rawBytes = [UInt8](rawData)
+        var currentConfigs: [UInt] = []
+        for i in 0..<4 {
+            let offset = 8 + i * 4
+            guard offset + 3 < rawBytes.count else { break }
+            let val = UInt(rawBytes[offset])
+                    | (UInt(rawBytes[offset + 1]) << 8)
+                    | (UInt(rawBytes[offset + 2]) << 16)
+                    | (UInt(rawBytes[offset + 3]) << 24)
+            currentConfigs.append(val)
+        }
+
+        for (index, value) in configs.enumerated() where index < currentConfigs.count {
+            currentConfigs[index] = value
+        }
+
+        print("⚙️  更新設備配置 (CAN)...")
+        for (i, v) in currentConfigs.enumerated() {
+            let changed = i < configs.count ? " ← 已修改" : ""
+            print("   CONFIG\(i): 0x\(String(format: "%08X", v))\(changed)")
+        }
+
+        for (index, value) in currentConfigs.enumerated() {
+            let sendBuffer = ISPCommandTool.toCanUpdateConfigCMD(index: index, value: value)
+            guard sendCommand(sendBuffer) != nil else {
+                return .failure(message: "更新配置逾時 (CAN，CONFIG\(index))", timeout: true)
+            }
+        }
+
+        print("✅ 配置更新成功 (CAN)")
+        return .success(message: "配置更新成功")
+    }
+
+    /// CAN：更新二進位檔案（無 CMD word，資料以 4 bytes 為一個分包單位，位址每包遞增 4）
+    private func updateBinaryCAN(fileData: Data, startAddress: UInt, name: String) -> ISPResult {
+        print("🚀 開始更新 \(name) (CAN)...")
+
+        let fileSize = fileData.count
+        let chunkSize = 4
+        let totalChunks = max(1, (fileSize + chunkSize - 1) / chunkSize)
+        var address = startAddress
+        var offset = 0
+        var currentChunk = 0
+
+        while offset < fileSize {
+            let remaining = fileSize - offset
+            let dataSize = min(remaining, chunkSize)
+            var chunkData = [UInt8](fileData.subdata(in: offset..<(offset + dataSize)))
+            if chunkData.count < chunkSize {
+                chunkData.append(contentsOf: Array(repeating: 0x00, count: chunkSize - chunkData.count))
+            }
+
+            let sendBuffer = ISPCommandTool.toUpdateBinCANCMD(startAddress: address.UIntTo4Bytes(), data: chunkData)
+            guard sendCommand(sendBuffer) != nil else {
+                return .failure(message: "更新 \(name) 逾時（CAN，包 \(currentChunk + 1)/\(totalChunks)）", timeout: true)
+            }
+
+            address += UInt(chunkSize)
+            offset += dataSize
+            currentChunk += 1
+
+            if currentChunk % 64 == 0 || currentChunk == totalChunks {
+                let progress = (currentChunk * 100) / totalChunks
+                print("   進度: \(progress)% (\(currentChunk)/\(totalChunks) 包)")
+            }
+        }
+
+        print("✅ \(name) 更新完成 (CAN)")
+        return .success(message: "\(name) 更新完成")
+    }
+
+    /// CAN：運行 APROM
+    private func runAPROMCAN() -> ISPResult {
+        print("🚀 送出 RUN_APROM 命令 (CAN)...")
+
+        let sendBuffer = ISPCommandTool.toCanRunAPROMCMD()
+        // 送出命令後設備立即跳轉到 APROM，斷線屬於正常現象，不視為錯誤
+        _ = sendCommand(sendBuffer)
+
+        print("✅ 設備已重啟進入 APROM")
+        return .success(message: "設備已重啟")
     }
 }
